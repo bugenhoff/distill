@@ -48,6 +48,12 @@ def _parse_args() -> argparse.Namespace:
 
     parser.add_argument("--alpha", type=float, default=0.8, help="Hard/KD blend: total = alpha*hard + (1-alpha)*kd")
     parser.add_argument("--temperature", type=float, default=2.0)
+    parser.add_argument("--kd-gain", type=float, default=1.0, help="Global multiplier for KD component")
+    parser.add_argument("--kd-cls-weight", type=float, default=1.0, help="KD weight for class logits")
+    parser.add_argument("--kd-box-weight", type=float, default=0.35, help="KD weight for box regression")
+    parser.add_argument("--kd-mask-weight", type=float, default=0.6, help="KD weight for mask coefficients")
+    parser.add_argument("--kd-proto-weight", type=float, default=0.6, help="KD weight for proto masks")
+    parser.add_argument("--kd-semseg-weight", type=float, default=0.4, help="KD weight for semantic head")
 
     parser.add_argument(
         "--export",
@@ -101,6 +107,12 @@ def main() -> None:
         seed=args.seed,
         alpha=args.alpha,
         temperature=args.temperature,
+        kd_gain=args.kd_gain,
+        kd_cls_weight=args.kd_cls_weight,
+        kd_box_weight=args.kd_box_weight,
+        kd_mask_weight=args.kd_mask_weight,
+        kd_proto_weight=args.kd_proto_weight,
+        kd_semseg_weight=args.kd_semseg_weight,
         export_formats=tuple(args.export),
         onnx_opset=args.onnx_opset,
         export_dynamic=args.export_dynamic,

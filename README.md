@@ -83,3 +83,35 @@ uv run python -c "import ultralytics, onnx, openvino, torch; print('ok')"
 
 - Запускай GUI именно через `uv run distill_yolo26_seg_gui.py`.
 - В GUI оставляй `device=auto`, тогда будет проверка CUDA в целевом интерпретаторе.
+
+### Почему в GUI не видно `pacman` логов
+
+- Команда `sudo pacman -Syu --needed nvidia-utils cuda cudnn` выполняется отдельно от процесса обучения.
+- Лог в GUI показывает только вывод процесса дистилляции, а не системные команды установки пакетов.
+
+### Как читать этапы обучения в логе
+
+Ищи строки с префиксами:
+
+- `[DISTILL] Stage=prepare|train_begin|train_done|export_begin|export_done|parity_begin|parity_done`
+- `[PROGRESS] Stage=epoch_start epoch=X/Y`
+- `[PROGRESS] Stage=epoch_end epoch=X/Y train_loss=... kd_loss=... lr=...`
+- `[PROGRESS] Stage=val_end mAP50=... mAP50-95=...`
+
+## Рекомендованные пресеты KD (цель: качество + OpenVINO)
+
+Ниже настройки для GUI, если основная цель - точность ближе к учителю при `imgsz=320`:
+
+- `epochs=700`
+- `batch=16` (или больше, если VRAM позволяет)
+- `patience=100`
+- `alpha=0.65`
+- `temperature=3.0`
+- `kd_gain=1.1`
+- `kd_cls_w=1.0`
+- `kd_box_w=0.40`
+- `kd_mask_w=0.75`
+- `kd_proto_w=0.70`
+- `kd_semseg_w=0.50`
+
+Для более агрессивной скорости на инференсе после обучения можно пробовать OpenVINO INT8-квантизацию (обычно быстрее, но иногда с просадкой mAP).

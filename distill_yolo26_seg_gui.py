@@ -75,6 +75,12 @@ class DistillGui(tk.Tk):
 
         self.alpha_var = tk.StringVar(value="0.8")
         self.temperature_var = tk.StringVar(value="2.0")
+        self.kd_gain_var = tk.StringVar(value="1.0")
+        self.kd_cls_weight_var = tk.StringVar(value="1.0")
+        self.kd_box_weight_var = tk.StringVar(value="0.35")
+        self.kd_mask_weight_var = tk.StringVar(value="0.6")
+        self.kd_proto_weight_var = tk.StringVar(value="0.6")
+        self.kd_semseg_weight_var = tk.StringVar(value="0.4")
 
         self.export_onnx_var = tk.BooleanVar(value=True)
         self.export_openvino_var = tk.BooleanVar(value=True)
@@ -102,6 +108,10 @@ class DistillGui(tk.Tk):
         params = ttk.LabelFrame(root, text="Training params", padding=10)
         params.pack(fill="x", pady=(10, 0))
         self._add_simple_grid(params)
+
+        kd_params = ttk.LabelFrame(root, text="KD params", padding=10)
+        kd_params.pack(fill="x", pady=(10, 0))
+        self._add_kd_grid(kd_params)
 
         exports = ttk.LabelFrame(root, text="Export", padding=10)
         exports.pack(fill="x", pady=(10, 0))
@@ -145,6 +155,22 @@ class DistillGui(tk.Tk):
         for idx, (label, var) in enumerate(entries):
             r = idx // 5
             c = (idx % 5) * 2
+            ttk.Label(parent, text=label).grid(row=r, column=c, sticky="w", padx=(0, 4), pady=2)
+            ttk.Entry(parent, textvariable=var, width=10).grid(row=r, column=c + 1, sticky="w", padx=(0, 16), pady=2)
+
+    def _add_kd_grid(self, parent: ttk.LabelFrame) -> None:
+        entries = [
+            ("kd_gain", self.kd_gain_var),
+            ("kd_cls_w", self.kd_cls_weight_var),
+            ("kd_box_w", self.kd_box_weight_var),
+            ("kd_mask_w", self.kd_mask_weight_var),
+            ("kd_proto_w", self.kd_proto_weight_var),
+            ("kd_semseg_w", self.kd_semseg_weight_var),
+        ]
+
+        for idx, (label, var) in enumerate(entries):
+            r = idx // 3
+            c = (idx % 3) * 2
             ttk.Label(parent, text=label).grid(row=r, column=c, sticky="w", padx=(0, 4), pady=2)
             ttk.Entry(parent, textvariable=var, width=10).grid(row=r, column=c + 1, sticky="w", padx=(0, 16), pady=2)
 
@@ -223,6 +249,18 @@ class DistillGui(tk.Tk):
             self.alpha_var.get().strip(),
             "--temperature",
             self.temperature_var.get().strip(),
+            "--kd-gain",
+            self.kd_gain_var.get().strip(),
+            "--kd-cls-weight",
+            self.kd_cls_weight_var.get().strip(),
+            "--kd-box-weight",
+            self.kd_box_weight_var.get().strip(),
+            "--kd-mask-weight",
+            self.kd_mask_weight_var.get().strip(),
+            "--kd-proto-weight",
+            self.kd_proto_weight_var.get().strip(),
+            "--kd-semseg-weight",
+            self.kd_semseg_weight_var.get().strip(),
             "--outdir",
             self.outdir_var.get().strip(),
         ]
@@ -358,6 +396,12 @@ class DistillGui(tk.Tk):
             "device": self.device_var,
             "alpha": self.alpha_var,
             "temperature": self.temperature_var,
+            "kd_gain": self.kd_gain_var,
+            "kd_cls_weight": self.kd_cls_weight_var,
+            "kd_box_weight": self.kd_box_weight_var,
+            "kd_mask_weight": self.kd_mask_weight_var,
+            "kd_proto_weight": self.kd_proto_weight_var,
+            "kd_semseg_weight": self.kd_semseg_weight_var,
         }
         bool_fields = {
             "export_onnx": self.export_onnx_var,
@@ -389,6 +433,12 @@ class DistillGui(tk.Tk):
             "device": self.device_var.get().strip(),
             "alpha": self.alpha_var.get().strip(),
             "temperature": self.temperature_var.get().strip(),
+            "kd_gain": self.kd_gain_var.get().strip(),
+            "kd_cls_weight": self.kd_cls_weight_var.get().strip(),
+            "kd_box_weight": self.kd_box_weight_var.get().strip(),
+            "kd_mask_weight": self.kd_mask_weight_var.get().strip(),
+            "kd_proto_weight": self.kd_proto_weight_var.get().strip(),
+            "kd_semseg_weight": self.kd_semseg_weight_var.get().strip(),
             "export_onnx": bool(self.export_onnx_var.get()),
             "export_openvino": bool(self.export_openvino_var.get()),
             "dynamic": bool(self.dynamic_var.get()),

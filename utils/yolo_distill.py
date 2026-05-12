@@ -266,6 +266,80 @@ class DistillationSegTrainer(SegmentationTrainer):
         self._best_selection_fitness = -math.inf
 
         super().__init__(overrides=overrides)
+        self._register_progress_callbacks()
+
+    def _register_progress_callbacks(self) -> None:
+        self.add_callback("on_train_start", self._cb_on_train_start)
+        self.add_callback("on_train_epoch_start", self._cb_on_train_epoch_start)
+        self.add_callback("on_train_epoch_end", self._cb_on_train_epoch_end)
+        self.add_callback("on_val_end", self._cb_on_val_end)
+        self.add_callback("on_train_end", self._cb_on_train_end)
+
+    def _cb_on_train_start(self, trainer: "DistillationSegTrainer") -> None:
+        LOGGER.info(
+            "[PROGRESS] Stage=train_start epochs=%s batch=%s imgsz=%s device=%s",
+            getattr(trainer, "epochs", "?"),
+            getattr(trainer, "batch_size", "?"),
+            getattr(getattr(trainer, "args", None), "imgsz", "?"),
+            getattr(trainer, "device", "?"),
+        )
+
+    def _cb_on_train_epoch_start(self, trainer: "DistillationSegTrainer") -> None:
+        epoch_idx = int(getattr(trainer, "epoch", -1)) + 1
+        total_epochs = int(getattr(trainer, "epochs", 0))
+        LOGGER.info("[PROGRESS] Stage=epoch_start epoch=%d/%d", epoch_idx, max(total_epochs, 1))
+
+    def _cb_on_train_epoch_end(self, trainer: "DistillationSegTrainer") -> None:
+        epoch_idx = int(getattr(trainer, "epoch", -1)) + 1
+        total_epochs = int(getattr(trainer, "epochs", 0))
+
+        lr = None
+        optimizer = getattr(trainer, "optimizer", None)
+        if optimizer is not None and getattr(optimizer, "param_groups", None):
+            lr = optimizer.param_groups[0].get("lr")
+
+        tloss = getattr(trainer, "tloss", None)
+        train_loss = None
+        if isinstance(tloss, torch.Tensor):
+            values = tloss.detach().float().cpu().flatten().tolist()
+            if values:
+                train_loss = float(sum(values) / len(values))
+        elif isinstance(tloss, (list, tuple)):
+            values = [float(x) for x in tloss]
+            if values:
+                train_loss = float(sum(values) / len(values))
+
+        criterion = getattr(unwrap_model(trainer.model), "criterion", None)
+        kd_loss = float(getattr(criterion, "last_kd_loss", 0.0)) if criterion is not None else 0.0
+
+        LOGGER.info(
+            "[PROGRESS] Stage=epoch_end epoch=%d/%d train_loss=%s kd_loss=%.6f lr=%s",
+            epoch_idx,
+            max(total_epochs, 1),
+            f"{train_loss:.6f}" if train_loss is not None else "n/a",
+            kd_loss,
+            f"{float(lr):.8f}" if lr is not None else "n/a",
+        )
+
+    def _cb_on_val_end(self, trainer: "DistillationSegTrainer") -> None:
+        metrics = getattr(trainer, "metrics", None)
+        if not isinstance(metrics, dict):
+            return
+
+        map50 = metrics.get("metrics/mAP50(M)", metrics.get("metrics/mAP50(B)"))
+        map5095 = metrics.get("metrics/mAP50-95(M)", metrics.get("metrics/mAP50-95(B)"))
+        if map50 is None and map5095 is None:
+            return
+
+        map50_str = f"{float(map50):.5f}" if map50 is not None else "n/a"
+        map5095_str = f"{float(map5095):.5f}" if map5095 is not None else "n/a"
+        LOGGER.info("[PROGRESS] Stage=val_end mAP50=%s mAP50-95=%s", map50_str, map5095_str)
+
+    def _cb_on_train_end(self, trainer: "DistillationSegTrainer") -> None:
+        best = getattr(trainer, "best", None)
+        best_fitness = getattr(trainer, "best_fitness", None)
+        best_fitness_str = f"{float(best_fitness):.6f}" if best_fitness is not None else "n/a"
+        LOGGER.info("[PROGRESS] Stage=train_end best_fitness=%s best=%s", best_fitness_str, best)
 
     def _setup_train(self):
         super()._setup_train()
@@ -350,6 +424,7 @@ class DistillationSegTrainer(SegmentationTrainer):
 def run_distillation(config: DistillationConfig) -> dict[str, Any]:
     outdir = Path(config.outdir).resolve()
     outdir.mkdir(parents=True, exist_ok=True)
+    LOGGER.info("[DISTILL] Stage=prepare outdir=%s", outdir)
     resolved_device = _resolve_ultralytics_device(config.device)
     resolved_data = _resolve_data_source(config.data, outdir=outdir)
     train_fliplr = _resolve_train_fliplr_for_data_yaml(resolved_data, default_fliplr=0.5)
@@ -408,7 +483,9 @@ def run_distillation(config: DistillationConfig) -> dict[str, Any]:
         kd_semseg_weight=config.kd_semseg_weight,
         overrides=overrides,
     )
+    LOGGER.info("[DISTILL] Stage=train_begin run_name=%s", config.run_name)
     trainer.train()
+    LOGGER.info("[DISTILL] Stage=train_done")
 
     run_dir = Path(trainer.save_dir).resolve()
     best_from_run = Path(trainer.best).resolve()
@@ -428,6 +505,7 @@ def run_distillation(config: DistillationConfig) -> dict[str, Any]:
     export_reports: list[dict[str, Any]] = []
     exported_paths: dict[str, str] = {}
     if config.export_formats:
+        LOGGER.info("[DISTILL] Stage=export_begin formats=%s", list(config.export_formats))
         exported_paths, export_reports = export_model_artifacts(
             model_path=best_distilled,
             outdir=outdir,
@@ -441,7 +519,9 @@ def run_distillation(config: DistillationConfig) -> dict[str, Any]:
             end2end=config.export_end2end,
             strict_validation=config.strict_export_validation,
         )
+        LOGGER.info("[DISTILL] Stage=export_done artifacts=%s", exported_paths)
 
+    LOGGER.info("[DISTILL] Stage=parity_begin samples=%d", int(config.parity_samples))
     parity = run_export_parity_check(
         model_path=best_distilled,
         exported=exported_paths,
@@ -449,6 +529,7 @@ def run_distillation(config: DistillationConfig) -> dict[str, Any]:
         imgsz=config.imgsz,
         max_samples=config.parity_samples,
     )
+    LOGGER.info("[DISTILL] Stage=parity_done ok=%s", None if parity is None else parity.get("ok"))
     if config.strict_parity and parity and not parity.get("ok", True):
         raise RuntimeError(f"Export parity check failed: {parity}")
 
