@@ -44,6 +44,69 @@ def _resolve_python_executable(script_dir: Path) -> str:
     return sys.executable
 
 
+def _check_python_runtime_requirements(python_exec: str, *, need_onnx: bool, need_openvino: bool) -> tuple[bool, str]:
+    check_script = (
+        "import importlib.util as u\n"
+        "required=['torch','ultralytics']\n"
+        "if int(__import__('os').environ.get('NEED_ONNX','0')): required.append('onnx')\n"
+        "if int(__import__('os').environ.get('NEED_OPENVINO','0')): required.append('openvino')\n"
+        "missing=[m for m in required if u.find_spec(m) is None]\n"
+        "cuda_ok=False\n"
+        "torch_error=''\n"
+        "try:\n"
+        "  import torch\n"
+        "  cuda_ok=bool(torch.cuda.is_available())\n"
+        "except Exception as e:\n"
+        "  torch_error=str(e)\n"
+        "import json\n"
+        "print(json.dumps({'missing':missing,'cuda_ok':cuda_ok,'torch_error':torch_error}, ensure_ascii=False))\n"
+    )
+
+    env = os.environ.copy()
+    env["NEED_ONNX"] = "1" if need_onnx else "0"
+    env["NEED_OPENVINO"] = "1" if need_openvino else "0"
+    probe = subprocess.run(
+        [python_exec, "-c", check_script],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    if probe.returncode != 0:
+        details = (probe.stderr or probe.stdout or "").strip()
+        msg = "Не удалось проверить Python-пакеты в целевом окружении."
+        if details:
+            msg = f"{msg}\n\nДетали:\n{details}"
+        return False, msg
+
+    try:
+        payload = json.loads(probe.stdout.strip())
+    except Exception:
+        return False, "Не удалось разобрать результат проверки пакетов. Выполните: uv sync"
+
+    missing = payload.get("missing") if isinstance(payload, dict) else None
+    cuda_ok = payload.get("cuda_ok") if isinstance(payload, dict) else False
+    torch_error = payload.get("torch_error") if isinstance(payload, dict) else ""
+
+    if not isinstance(missing, list):
+        return False, "Некорректный формат проверки пакетов. Выполните: uv sync"
+
+    problems: list[str] = []
+    if missing:
+        problems.append("Не найдены Python-пакеты: " + ", ".join(str(x) for x in missing))
+    if not cuda_ok:
+        problems.append("CUDA недоступна в torch (torch.cuda.is_available() == False)")
+    if torch_error:
+        problems.append(f"Ошибка torch: {torch_error}")
+
+    if problems:
+        install_hint = "Установите зависимости и проверьте GPU:\n1) uv sync\n2) uv run python -c \"import torch; print(torch.cuda.is_available())\""
+        return False, "\n\n".join(["\n".join(problems), install_hint])
+
+    return True, ""
+
+
 class DistillGui(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
@@ -286,6 +349,20 @@ class DistillGui(tk.Tk):
         if self._proc is not None:
             return
         if not self._validate_inputs():
+            return
+
+        script_path = Path(__file__).resolve().with_name("distill_yolo26_seg.py")
+        py_exec = _resolve_python_executable(script_path.parent)
+        need_onnx = bool(self.export_onnx_var.get())
+        need_openvino = bool(self.export_openvino_var.get())
+        ok, preflight_message = _check_python_runtime_requirements(
+            py_exec,
+            need_onnx=need_onnx,
+            need_openvino=need_openvino,
+        )
+        if not ok:
+            messagebox.showerror("Missing dependencies", preflight_message)
+            self._append_log(f"[PRECHECK ERROR] {preflight_message}\n")
             return
 
         try:
