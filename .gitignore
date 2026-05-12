@@ -1,0 +1,50 @@
+# Python cache and env
+__pycache__/
+*.py[cod]
+*.so
+.venv/
+.python-version
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Editors and OS
+.vscode/
+.idea/
+.serena/
+.DS_Store
+Thumbs.db
+
+# Training artifacts
+runs/
+YOLOx-1280size_img/
+distill_yolo26_seg/
+*.autofix.local.yaml
+*.autofix.local.yml
+selection_metrics.jsonl
+results.csv
+args.yaml
+
+# Export artifacts
+*.onnx
+*_openvino_model/
+*.xml
+*.bin
+
+# Weights and checkpoints
+*.pt
+
+# Logs and temp
+*.log
+*.tmp
+
+# Dataset generated files
+nano-detect-model/Fishi-fishi-move-move-saddle.v2i.yolo26/train_oversampled.txt
+
+# Legacy nano-detect sandbox (heavy dataset and old experiments)
+nano-detect-model/
+
+# Large dataset splits
+nano-detect-model/Fishi-fishi-move-move-saddle.v2i.yolo26/train/
+nano-detect-model/Fishi-fishi-move-move-saddle.v2i.yolo26/valid/
+nano-detect-model/Fishi-fishi-move-move-saddle.v2i.yolo26/test/
