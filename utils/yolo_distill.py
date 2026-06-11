@@ -11,6 +11,8 @@ import torch
 import torch.nn.functional as F
 
 from ultralytics import YOLO
+from ultralytics.models.yolo.detect.train import DetectionTrainer
+from ultralytics.models.yolo.pose.train import PoseTrainer
 from ultralytics.models.yolo.segment.train import SegmentationTrainer
 from ultralytics.utils import LOGGER, YAML
 from ultralytics.utils.torch_utils import unwrap_model
@@ -20,6 +22,7 @@ _IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 
 @dataclass(slots=True)
 class DistillationConfig:
+    task: str
     teacher: str
     student_init: str
     data: str
@@ -41,6 +44,7 @@ class DistillationConfig:
     kd_mask_weight: float = 0.6
     kd_proto_weight: float = 0.6
     kd_semseg_weight: float = 0.4
+    kd_kpt_weight: float = 0.6
     seed: int = 42
     amp: bool = True
     export_formats: tuple[str, ...] = ("onnx", "openvino")
@@ -53,6 +57,7 @@ class DistillationConfig:
     parity_samples: int = 12
     strict_export_validation: bool = False
     strict_parity: bool = False
+    openvino_int8: bool = False
 
 
 class SegmentationDistillationCriterion:
@@ -233,6 +238,428 @@ class SegmentationDistillationCriterion:
         if s_semseg.shape[-2:] != t_semseg.shape[-2:]:
             t_semseg = F.interpolate(t_semseg, size=s_semseg.shape[-2:], mode="bilinear", align_corners=False)
         return F.mse_loss(s_semseg, t_semseg)
+
+
+class PoseDistillationCriterion:
+    """Wraps Ultralytics pose criterion and adds teacher-student KD loss."""
+
+    def __init__(
+        self,
+        base_criterion: Any,
+        teacher_model: torch.nn.Module,
+        student_model: torch.nn.Module,
+        *,
+        alpha: float,
+        temperature: float,
+        kd_gain: float,
+        kd_cls_weight: float,
+        kd_box_weight: float,
+        kd_kpt_weight: float,
+    ) -> None:
+        self.base_criterion = base_criterion
+        self.teacher_model = teacher_model
+        self.student_model = student_model
+
+        self.alpha = float(alpha)
+        self.temperature = max(float(temperature), 1e-6)
+        self.kd_gain = max(float(kd_gain), 0.0)
+
+        self.kd_cls_weight = max(float(kd_cls_weight), 0.0)
+        self.kd_box_weight = max(float(kd_box_weight), 0.0)
+        self.kd_kpt_weight = max(float(kd_kpt_weight), 0.0)
+        self._mismatch_warnings: set[str] = set()
+
+        self.last_kd_loss = 0.0
+
+    def __call__(self, preds: Any, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+        hard_loss, hard_items = self.base_criterion(preds, batch)
+
+        if not self.student_model.training or self.alpha >= 1.0 or self.kd_gain <= 0.0:
+            self.last_kd_loss = 0.0
+            return hard_loss, hard_items
+
+        with torch.no_grad():
+            teacher_raw = self.teacher_model(batch["img"])
+
+        student_head = _extract_head_for_kd(preds)
+        teacher_head = _extract_head_for_kd(teacher_raw)
+        kd_loss = self._compute_kd_loss(student_head, teacher_head)
+
+        total_loss = self.alpha * hard_loss + (1.0 - self.alpha) * self.kd_gain * kd_loss
+        self.last_kd_loss = float(kd_loss.detach().cpu())
+        return total_loss, hard_items
+
+    def update(self) -> None:
+        if hasattr(self.base_criterion, "update"):
+            self.base_criterion.update()
+
+    def _warn_mismatch_once(self, key: str, student_shape: Any, teacher_shape: Any) -> None:
+        if key in self._mismatch_warnings:
+            return
+        self._mismatch_warnings.add(key)
+        LOGGER.warning(
+            "[DISTILL] Skip KD term '%s' due to incompatible shapes: student=%s teacher=%s",
+            key,
+            student_shape,
+            teacher_shape,
+        )
+
+    def _compute_kd_loss(self, student_head: dict[str, Any], teacher_head: dict[str, Any]) -> torch.Tensor:
+        losses: list[torch.Tensor] = []
+        weights: list[float] = []
+
+        cls_loss = self._kd_cls(student_head, teacher_head)
+        if cls_loss is not None and self.kd_cls_weight > 0:
+            losses.append(cls_loss)
+            weights.append(self.kd_cls_weight)
+
+        box_loss = self._kd_boxes(student_head, teacher_head)
+        if box_loss is not None and self.kd_box_weight > 0:
+            losses.append(box_loss)
+            weights.append(self.kd_box_weight)
+
+        kpt_loss = self._kd_keypoints(student_head, teacher_head)
+        if kpt_loss is not None and self.kd_kpt_weight > 0:
+            losses.append(kpt_loss)
+            weights.append(self.kd_kpt_weight)
+
+        if not losses:
+            return _zero_like(student_head)
+
+        total_weight = sum(weights)
+        weighted = sum(loss * weight for loss, weight in zip(losses, weights))
+        return weighted / max(total_weight, 1e-12)
+
+    def _kd_cls(self, student_head: dict[str, Any], teacher_head: dict[str, Any]) -> torch.Tensor | None:
+        s_scores = student_head.get("scores")
+        t_scores = teacher_head.get("scores")
+        if not isinstance(s_scores, torch.Tensor) or not isinstance(t_scores, torch.Tensor):
+            return None
+
+        if s_scores.shape != t_scores.shape:
+            self._warn_mismatch_once("cls", tuple(s_scores.shape), tuple(t_scores.shape))
+            return None
+
+        if s_scores.shape[1] == 1:
+            return F.binary_cross_entropy_with_logits(
+                s_scores / self.temperature,
+                torch.sigmoid(t_scores / self.temperature),
+            )
+
+        s_log_probs = F.log_softmax((s_scores / self.temperature).transpose(1, 2), dim=-1)
+        t_probs = F.softmax((t_scores / self.temperature).transpose(1, 2), dim=-1)
+        return F.kl_div(s_log_probs, t_probs, reduction="batchmean") * (self.temperature**2)
+
+    def _kd_boxes(self, student_head: dict[str, Any], teacher_head: dict[str, Any]) -> torch.Tensor | None:
+        s_boxes = student_head.get("boxes")
+        t_boxes = teacher_head.get("boxes")
+        if not isinstance(s_boxes, torch.Tensor) or not isinstance(t_boxes, torch.Tensor):
+            return None
+
+        if s_boxes.shape != t_boxes.shape:
+            self._warn_mismatch_once("box", tuple(s_boxes.shape), tuple(t_boxes.shape))
+            return None
+        return F.smooth_l1_loss(s_boxes, t_boxes.detach())
+
+    def _kd_keypoints(self, student_head: dict[str, Any], teacher_head: dict[str, Any]) -> torch.Tensor | None:
+        s_kpts = student_head.get("kpts")
+        t_kpts = teacher_head.get("kpts")
+        if not isinstance(s_kpts, torch.Tensor) or not isinstance(t_kpts, torch.Tensor):
+            return None
+
+        if s_kpts.shape != t_kpts.shape:
+            self._warn_mismatch_once("kpts", tuple(s_kpts.shape), tuple(t_kpts.shape))
+            return None
+        return F.smooth_l1_loss(s_kpts, t_kpts.detach())
+
+
+class DetectionDistillationCriterion:
+    """Wraps Ultralytics detection criterion and adds teacher-student KD loss."""
+
+    def __init__(
+        self,
+        base_criterion: Any,
+        teacher_model: torch.nn.Module,
+        student_model: torch.nn.Module,
+        *,
+        alpha: float,
+        temperature: float,
+        kd_gain: float,
+        kd_cls_weight: float,
+        kd_box_weight: float,
+    ) -> None:
+        self.base_criterion = base_criterion
+        self.teacher_model = teacher_model
+        self.student_model = student_model
+
+        self.alpha = float(alpha)
+        self.temperature = max(float(temperature), 1e-6)
+        self.kd_gain = max(float(kd_gain), 0.0)
+
+        self.kd_cls_weight = max(float(kd_cls_weight), 0.0)
+        self.kd_box_weight = max(float(kd_box_weight), 0.0)
+        self._mismatch_warnings: set[str] = set()
+
+        self.last_kd_loss = 0.0
+
+    def __call__(self, preds: Any, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+        hard_loss, hard_items = self.base_criterion(preds, batch)
+
+        if not self.student_model.training or self.alpha >= 1.0 or self.kd_gain <= 0.0:
+            self.last_kd_loss = 0.0
+            return hard_loss, hard_items
+
+        with torch.no_grad():
+            teacher_raw = self.teacher_model(batch["img"])
+
+        student_head = _extract_head_for_kd(preds)
+        teacher_head = _extract_head_for_kd(teacher_raw)
+        kd_loss = self._compute_kd_loss(student_head, teacher_head)
+
+        total_loss = self.alpha * hard_loss + (1.0 - self.alpha) * self.kd_gain * kd_loss
+        self.last_kd_loss = float(kd_loss.detach().cpu())
+        return total_loss, hard_items
+
+    def update(self) -> None:
+        if hasattr(self.base_criterion, "update"):
+            self.base_criterion.update()
+
+    def _warn_mismatch_once(self, key: str, student_shape: Any, teacher_shape: Any) -> None:
+        if key in self._mismatch_warnings:
+            return
+        self._mismatch_warnings.add(key)
+        LOGGER.warning(
+            "[DISTILL] Skip KD term '%s' due to incompatible shapes: student=%s teacher=%s",
+            key,
+            student_shape,
+            teacher_shape,
+        )
+
+    def _compute_kd_loss(self, student_head: dict[str, Any], teacher_head: dict[str, Any]) -> torch.Tensor:
+        losses: list[torch.Tensor] = []
+        weights: list[float] = []
+
+        cls_loss = self._kd_cls(student_head, teacher_head)
+        if cls_loss is not None and self.kd_cls_weight > 0:
+            losses.append(cls_loss)
+            weights.append(self.kd_cls_weight)
+
+        box_loss = self._kd_boxes(student_head, teacher_head)
+        if box_loss is not None and self.kd_box_weight > 0:
+            losses.append(box_loss)
+            weights.append(self.kd_box_weight)
+
+        if not losses:
+            return _zero_like(student_head)
+
+        total_weight = sum(weights)
+        weighted = sum(loss * weight for loss, weight in zip(losses, weights))
+        return weighted / max(total_weight, 1e-12)
+
+    def _kd_cls(self, student_head: dict[str, Any], teacher_head: dict[str, Any]) -> torch.Tensor | None:
+        s_scores = student_head.get("scores")
+        t_scores = teacher_head.get("scores")
+        if not isinstance(s_scores, torch.Tensor) or not isinstance(t_scores, torch.Tensor):
+            return None
+
+        if s_scores.shape != t_scores.shape:
+            self._warn_mismatch_once("cls", tuple(s_scores.shape), tuple(t_scores.shape))
+            return None
+
+        if s_scores.shape[1] == 1:
+            return F.binary_cross_entropy_with_logits(
+                s_scores / self.temperature,
+                torch.sigmoid(t_scores / self.temperature),
+            )
+
+        s_log_probs = F.log_softmax((s_scores / self.temperature).transpose(1, 2), dim=-1)
+        t_probs = F.softmax((t_scores / self.temperature).transpose(1, 2), dim=-1)
+        return F.kl_div(s_log_probs, t_probs, reduction="batchmean") * (self.temperature**2)
+
+    def _kd_boxes(self, student_head: dict[str, Any], teacher_head: dict[str, Any]) -> torch.Tensor | None:
+        s_boxes = student_head.get("boxes")
+        t_boxes = teacher_head.get("boxes")
+        if not isinstance(s_boxes, torch.Tensor) or not isinstance(t_boxes, torch.Tensor):
+            return None
+
+        if s_boxes.shape != t_boxes.shape:
+            self._warn_mismatch_once("box", tuple(s_boxes.shape), tuple(t_boxes.shape))
+            return None
+        return F.smooth_l1_loss(s_boxes, t_boxes.detach())
+
+
+class DistillationDetectTrainer(DetectionTrainer):
+    """DetectionTrainer with integrated teacher distillation and simple mAP-based best checkpoint selection."""
+
+    def __init__(
+        self,
+        *,
+        teacher_weights: str,
+        alpha: float,
+        temperature: float,
+        kd_gain: float,
+        kd_cls_weight: float,
+        kd_box_weight: float,
+        overrides: dict[str, Any],
+    ) -> None:
+        self.teacher_weights = teacher_weights
+        self.alpha = float(alpha)
+        self.temperature = float(temperature)
+        self.kd_gain = float(kd_gain)
+        self.kd_cls_weight = float(kd_cls_weight)
+        self.kd_box_weight = float(kd_box_weight)
+
+        self._teacher_model: torch.nn.Module | None = None
+        self._best_selection_fitness = -math.inf
+
+        super().__init__(overrides=overrides)
+        self._register_progress_callbacks()
+
+    def _register_progress_callbacks(self) -> None:
+        self.add_callback("on_train_start", self._cb_on_train_start)
+        self.add_callback("on_train_epoch_start", self._cb_on_train_epoch_start)
+        self.add_callback("on_train_epoch_end", self._cb_on_train_epoch_end)
+        self.add_callback("on_val_end", self._cb_on_val_end)
+        self.add_callback("on_train_end", self._cb_on_train_end)
+
+    def _cb_on_train_start(self, trainer: "DistillationDetectTrainer") -> None:
+        LOGGER.info(
+            "[PROGRESS] Stage=train_start epochs=%s batch=%s imgsz=%s device=%s",
+            getattr(trainer, "epochs", "?"),
+            getattr(trainer, "batch_size", "?"),
+            getattr(getattr(trainer, "args", None), "imgsz", "?"),
+            getattr(trainer, "device", "?"),
+        )
+
+    def _cb_on_train_epoch_start(self, trainer: "DistillationDetectTrainer") -> None:
+        epoch_idx = int(getattr(trainer, "epoch", -1)) + 1
+        total_epochs = int(getattr(trainer, "epochs", 0))
+        LOGGER.info("[PROGRESS] Stage=epoch_start epoch=%d/%d", epoch_idx, max(total_epochs, 1))
+
+    def _cb_on_train_epoch_end(self, trainer: "DistillationDetectTrainer") -> None:
+        epoch_idx = int(getattr(trainer, "epoch", -1)) + 1
+        total_epochs = int(getattr(trainer, "epochs", 0))
+
+        lr = None
+        optimizer = getattr(trainer, "optimizer", None)
+        if optimizer is not None and getattr(optimizer, "param_groups", None):
+            lr = optimizer.param_groups[0].get("lr")
+
+        tloss = getattr(trainer, "tloss", None)
+        train_loss = None
+        if isinstance(tloss, torch.Tensor):
+            values = tloss.detach().float().cpu().flatten().tolist()
+            if values:
+                train_loss = float(sum(values) / len(values))
+        elif isinstance(tloss, (list, tuple)):
+            values = [float(x) for x in tloss]
+            if values:
+                train_loss = float(sum(values) / len(values))
+
+        criterion = getattr(unwrap_model(trainer.model), "criterion", None)
+        kd_loss = float(getattr(criterion, "last_kd_loss", 0.0)) if criterion is not None else 0.0
+
+        LOGGER.info(
+            "[PROGRESS] Stage=epoch_end epoch=%d/%d train_loss=%s kd_loss=%.6f lr=%s",
+            epoch_idx,
+            max(total_epochs, 1),
+            f"{train_loss:.6f}" if train_loss is not None else "n/a",
+            kd_loss,
+            f"{float(lr):.8f}" if lr is not None else "n/a",
+        )
+
+    def _cb_on_val_end(self, trainer: "DistillationDetectTrainer") -> None:
+        metrics = getattr(trainer, "metrics", None)
+        if not isinstance(metrics, dict):
+            return
+
+        map50 = metrics.get("metrics/mAP50(B)")
+        map5095 = metrics.get("metrics/mAP50-95(B)")
+        if map50 is None and map5095 is None:
+            return
+
+        map50_str = f"{float(map50):.5f}" if map50 is not None else "n/a"
+        map5095_str = f"{float(map5095):.5f}" if map5095 is not None else "n/a"
+        LOGGER.info("[PROGRESS] Stage=val_end mAP50=%s mAP50-95=%s", map50_str, map5095_str)
+
+    def _cb_on_train_end(self, trainer: "DistillationDetectTrainer") -> None:
+        best = getattr(trainer, "best", None)
+        best_fitness = getattr(trainer, "best_fitness", None)
+        best_fitness_str = f"{float(best_fitness):.6f}" if best_fitness is not None else "n/a"
+        LOGGER.info("[PROGRESS] Stage=train_end best_fitness=%s best=%s", best_fitness_str, best)
+
+    def _setup_train(self):
+        super()._setup_train()
+        self._setup_distillation()
+
+    def _setup_distillation(self) -> None:
+        LOGGER.info("[DISTILL] Loading teacher model: %s", self.teacher_weights)
+        teacher = YOLO(self.teacher_weights, task="detect", verbose=False)
+        teacher_model = teacher.model
+        teacher_model.to(self.device)
+        teacher_model.eval()
+        teacher_model.requires_grad_(False)
+
+        student_model = unwrap_model(self.model)
+        base_criterion = student_model.init_criterion()
+        student_model.criterion = DetectionDistillationCriterion(
+            base_criterion=base_criterion,
+            teacher_model=teacher_model,
+            student_model=student_model,
+            alpha=self.alpha,
+            temperature=self.temperature,
+            kd_gain=self.kd_gain,
+            kd_cls_weight=self.kd_cls_weight,
+            kd_box_weight=self.kd_box_weight,
+        )
+        self._teacher_model = teacher_model
+
+        LOGGER.info(
+            "[DISTILL] Enabled KD: alpha=%.3f temp=%.3f kd_gain=%.3f weights(cls=%.2f box=%.2f)",
+            self.alpha,
+            self.temperature,
+            self.kd_gain,
+            self.kd_cls_weight,
+            self.kd_box_weight,
+        )
+
+    def label_loss_items(self, loss_items: list[float] | None = None, prefix: str = "train"):
+        keys = [f"{prefix}/{x}" for x in self.loss_names]
+        if loss_items is None:
+            return keys
+
+        loss_list = [round(float(x), 5) for x in loss_items]
+        if len(loss_list) < len(keys):
+            loss_list.extend([0.0] * (len(keys) - len(loss_list)))
+        return dict(zip(keys, loss_list))
+
+    def validate(self):
+        metrics, default_fitness = super().validate()
+        if metrics is None:
+            return None, None
+
+        map_box = float(metrics.get("metrics/mAP50-95(B)", 0.0))
+        LOGGER.info("[DISTILL] Validation mAP50-95(B)=%.5f", map_box)
+
+        self._append_selection_log(
+            {
+                "epoch": int(getattr(self, "epoch", -1)) + 1,
+                "map50_95_b": map_box,
+                "fitness": map_box,
+            }
+        )
+
+        self._best_selection_fitness = max(self._best_selection_fitness, map_box)
+        self.best_fitness = self._best_selection_fitness
+
+        if default_fitness is None:
+            return metrics, map_box
+        return metrics, map_box
+
+    def _append_selection_log(self, payload: dict[str, Any]) -> None:
+        log_path = Path(self.save_dir) / "selection_metrics.jsonl"
+        with log_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
 class DistillationSegTrainer(SegmentationTrainer):
@@ -421,9 +848,188 @@ class DistillationSegTrainer(SegmentationTrainer):
             f.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
+class DistillationPoseTrainer(PoseTrainer):
+    """PoseTrainer with integrated teacher distillation and simple mAP-based best checkpoint selection."""
+
+    def __init__(
+        self,
+        *,
+        teacher_weights: str,
+        alpha: float,
+        temperature: float,
+        kd_gain: float,
+        kd_cls_weight: float,
+        kd_box_weight: float,
+        kd_kpt_weight: float,
+        overrides: dict[str, Any],
+    ) -> None:
+        self.teacher_weights = teacher_weights
+        self.alpha = float(alpha)
+        self.temperature = float(temperature)
+        self.kd_gain = float(kd_gain)
+        self.kd_cls_weight = float(kd_cls_weight)
+        self.kd_box_weight = float(kd_box_weight)
+        self.kd_kpt_weight = float(kd_kpt_weight)
+
+        self._teacher_model: torch.nn.Module | None = None
+        self._best_selection_fitness = -math.inf
+
+        super().__init__(overrides=overrides)
+        self._register_progress_callbacks()
+
+    def _register_progress_callbacks(self) -> None:
+        self.add_callback("on_train_start", self._cb_on_train_start)
+        self.add_callback("on_train_epoch_start", self._cb_on_train_epoch_start)
+        self.add_callback("on_train_epoch_end", self._cb_on_train_epoch_end)
+        self.add_callback("on_val_end", self._cb_on_val_end)
+        self.add_callback("on_train_end", self._cb_on_train_end)
+
+    def _cb_on_train_start(self, trainer: "DistillationPoseTrainer") -> None:
+        LOGGER.info(
+            "[PROGRESS] Stage=train_start epochs=%s batch=%s imgsz=%s device=%s",
+            getattr(trainer, "epochs", "?"),
+            getattr(trainer, "batch_size", "?"),
+            getattr(getattr(trainer, "args", None), "imgsz", "?"),
+            getattr(trainer, "device", "?"),
+        )
+
+    def _cb_on_train_epoch_start(self, trainer: "DistillationPoseTrainer") -> None:
+        epoch_idx = int(getattr(trainer, "epoch", -1)) + 1
+        total_epochs = int(getattr(trainer, "epochs", 0))
+        LOGGER.info("[PROGRESS] Stage=epoch_start epoch=%d/%d", epoch_idx, max(total_epochs, 1))
+
+    def _cb_on_train_epoch_end(self, trainer: "DistillationPoseTrainer") -> None:
+        epoch_idx = int(getattr(trainer, "epoch", -1)) + 1
+        total_epochs = int(getattr(trainer, "epochs", 0))
+
+        lr = None
+        optimizer = getattr(trainer, "optimizer", None)
+        if optimizer is not None and getattr(optimizer, "param_groups", None):
+            lr = optimizer.param_groups[0].get("lr")
+
+        tloss = getattr(trainer, "tloss", None)
+        train_loss = None
+        if isinstance(tloss, torch.Tensor):
+            values = tloss.detach().float().cpu().flatten().tolist()
+            if values:
+                train_loss = float(sum(values) / len(values))
+        elif isinstance(tloss, (list, tuple)):
+            values = [float(x) for x in tloss]
+            if values:
+                train_loss = float(sum(values) / len(values))
+
+        criterion = getattr(unwrap_model(trainer.model), "criterion", None)
+        kd_loss = float(getattr(criterion, "last_kd_loss", 0.0)) if criterion is not None else 0.0
+
+        LOGGER.info(
+            "[PROGRESS] Stage=epoch_end epoch=%d/%d train_loss=%s kd_loss=%.6f lr=%s",
+            epoch_idx,
+            max(total_epochs, 1),
+            f"{train_loss:.6f}" if train_loss is not None else "n/a",
+            kd_loss,
+            f"{float(lr):.8f}" if lr is not None else "n/a",
+        )
+
+    def _cb_on_val_end(self, trainer: "DistillationPoseTrainer") -> None:
+        metrics = getattr(trainer, "metrics", None)
+        if not isinstance(metrics, dict):
+            return
+
+        map50 = metrics.get("metrics/mAP50(P)", metrics.get("metrics/mAP50(B)"))
+        map5095 = metrics.get("metrics/mAP50-95(P)", metrics.get("metrics/mAP50-95(B)"))
+        if map50 is None and map5095 is None:
+            return
+
+        map50_str = f"{float(map50):.5f}" if map50 is not None else "n/a"
+        map5095_str = f"{float(map5095):.5f}" if map5095 is not None else "n/a"
+        LOGGER.info("[PROGRESS] Stage=val_end mAP50=%s mAP50-95=%s", map50_str, map5095_str)
+
+    def _cb_on_train_end(self, trainer: "DistillationPoseTrainer") -> None:
+        best = getattr(trainer, "best", None)
+        best_fitness = getattr(trainer, "best_fitness", None)
+        best_fitness_str = f"{float(best_fitness):.6f}" if best_fitness is not None else "n/a"
+        LOGGER.info("[PROGRESS] Stage=train_end best_fitness=%s best=%s", best_fitness_str, best)
+
+    def _setup_train(self):
+        super()._setup_train()
+        self._setup_distillation()
+
+    def _setup_distillation(self) -> None:
+        LOGGER.info("[DISTILL] Loading teacher model: %s", self.teacher_weights)
+        teacher = YOLO(self.teacher_weights, task="pose", verbose=False)
+        teacher_model = teacher.model
+        teacher_model.to(self.device)
+        teacher_model.eval()
+        teacher_model.requires_grad_(False)
+
+        student_model = unwrap_model(self.model)
+        base_criterion = student_model.init_criterion()
+        student_model.criterion = PoseDistillationCriterion(
+            base_criterion=base_criterion,
+            teacher_model=teacher_model,
+            student_model=student_model,
+            alpha=self.alpha,
+            temperature=self.temperature,
+            kd_gain=self.kd_gain,
+            kd_cls_weight=self.kd_cls_weight,
+            kd_box_weight=self.kd_box_weight,
+            kd_kpt_weight=self.kd_kpt_weight,
+        )
+        self._teacher_model = teacher_model
+
+        LOGGER.info(
+            "[DISTILL] Enabled KD: alpha=%.3f temp=%.3f kd_gain=%.3f weights(cls=%.2f box=%.2f kpt=%.2f)",
+            self.alpha,
+            self.temperature,
+            self.kd_gain,
+            self.kd_cls_weight,
+            self.kd_box_weight,
+            self.kd_kpt_weight,
+        )
+
+    def label_loss_items(self, loss_items: list[float] | None = None, prefix: str = "train"):
+        keys = [f"{prefix}/{x}" for x in self.loss_names]
+        if loss_items is None:
+            return keys
+
+        loss_list = [round(float(x), 5) for x in loss_items]
+        if len(loss_list) < len(keys):
+            loss_list.extend([0.0] * (len(keys) - len(loss_list)))
+        return dict(zip(keys, loss_list))
+
+    def validate(self):
+        metrics, default_fitness = super().validate()
+        if metrics is None:
+            return None, None
+
+        map_pose = float(metrics.get("metrics/mAP50-95(P)", metrics.get("metrics/mAP50-95(B)", 0.0)))
+        LOGGER.info("[DISTILL] Validation mAP50-95(P)=%.5f", map_pose)
+
+        self._append_selection_log(
+            {
+                "epoch": int(getattr(self, "epoch", -1)) + 1,
+                "map50_95_p": map_pose,
+                "fitness": map_pose,
+            }
+        )
+
+        self._best_selection_fitness = max(self._best_selection_fitness, map_pose)
+        self.best_fitness = self._best_selection_fitness
+
+        if default_fitness is None:
+            return metrics, map_pose
+        return metrics, map_pose
+
+    def _append_selection_log(self, payload: dict[str, Any]) -> None:
+        log_path = Path(self.save_dir) / "selection_metrics.jsonl"
+        with log_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
 def run_distillation(config: DistillationConfig) -> dict[str, Any]:
     outdir = Path(config.outdir).resolve()
     outdir.mkdir(parents=True, exist_ok=True)
+    resolved_task = _resolve_task(config.task)
     LOGGER.info("[DISTILL] Stage=prepare outdir=%s", outdir)
     resolved_device = _resolve_ultralytics_device(config.device)
     resolved_data = _resolve_data_source(config.data, outdir=outdir)
@@ -433,7 +1039,7 @@ def run_distillation(config: DistillationConfig) -> dict[str, Any]:
     LOGGER.info("[DISTILL] Augment setup: fliplr=%.3f (auto)", train_fliplr)
 
     overrides = {
-        "task": "segment",
+        "task": resolved_task,
         "model": _resolve_model_source(config.student_init),
         "data": resolved_data,
         "imgsz": int(config.imgsz),
@@ -471,18 +1077,40 @@ def run_distillation(config: DistillationConfig) -> dict[str, Any]:
         "multi_scale": 0.0,
     }
 
-    trainer = DistillationSegTrainer(
-        teacher_weights=_resolve_model_source(config.teacher),
-        alpha=config.alpha,
-        temperature=config.temperature,
-        kd_gain=config.kd_gain,
-        kd_cls_weight=config.kd_cls_weight,
-        kd_box_weight=config.kd_box_weight,
-        kd_mask_weight=config.kd_mask_weight,
-        kd_proto_weight=config.kd_proto_weight,
-        kd_semseg_weight=config.kd_semseg_weight,
-        overrides=overrides,
-    )
+    if resolved_task == "detect":
+        trainer = DistillationDetectTrainer(
+            teacher_weights=_resolve_model_source(config.teacher),
+            alpha=config.alpha,
+            temperature=config.temperature,
+            kd_gain=config.kd_gain,
+            kd_cls_weight=config.kd_cls_weight,
+            kd_box_weight=config.kd_box_weight,
+            overrides=overrides,
+        )
+    elif resolved_task == "segment":
+        trainer = DistillationSegTrainer(
+            teacher_weights=_resolve_model_source(config.teacher),
+            alpha=config.alpha,
+            temperature=config.temperature,
+            kd_gain=config.kd_gain,
+            kd_cls_weight=config.kd_cls_weight,
+            kd_box_weight=config.kd_box_weight,
+            kd_mask_weight=config.kd_mask_weight,
+            kd_proto_weight=config.kd_proto_weight,
+            kd_semseg_weight=config.kd_semseg_weight,
+            overrides=overrides,
+        )
+    else:
+        trainer = DistillationPoseTrainer(
+            teacher_weights=_resolve_model_source(config.teacher),
+            alpha=config.alpha,
+            temperature=config.temperature,
+            kd_gain=config.kd_gain,
+            kd_cls_weight=config.kd_cls_weight,
+            kd_box_weight=config.kd_box_weight,
+            kd_kpt_weight=config.kd_kpt_weight,
+            overrides=overrides,
+        )
     LOGGER.info("[DISTILL] Stage=train_begin run_name=%s", config.run_name)
     trainer.train()
     LOGGER.info("[DISTILL] Stage=train_done")
@@ -495,7 +1123,7 @@ def run_distillation(config: DistillationConfig) -> dict[str, Any]:
 
     selected_checkpoint = best_from_run
     checkpoint_probes = {
-        str(best_from_run): {"selected": True, "reason": "trainer_best_by_map50_95M"},
+        str(best_from_run): {"selected": True, "reason": f"trainer_best_by_{resolved_task}_map50_95"},
         str(last_from_run): {"selected": bool(last_from_run == best_from_run), "reason": "trainer_last"},
     }
 
@@ -518,6 +1146,8 @@ def run_distillation(config: DistillationConfig) -> dict[str, Any]:
             nms=config.export_nms,
             end2end=config.export_end2end,
             strict_validation=config.strict_export_validation,
+            openvino_int8=config.openvino_int8,
+            task=resolved_task,
         )
         LOGGER.info("[DISTILL] Stage=export_done artifacts=%s", exported_paths)
 
@@ -528,12 +1158,14 @@ def run_distillation(config: DistillationConfig) -> dict[str, Any]:
         data_yaml=resolved_data,
         imgsz=config.imgsz,
         max_samples=config.parity_samples,
+        task=resolved_task,
     )
     LOGGER.info("[DISTILL] Stage=parity_done ok=%s", None if parity is None else parity.get("ok"))
     if config.strict_parity and parity and not parity.get("ok", True):
         raise RuntimeError(f"Export parity check failed: {parity}")
 
     summary = {
+        "task": resolved_task,
         "run_dir": str(run_dir),
         "best_from_run": str(best_from_run),
         "last_from_run": str(last_from_run),
@@ -546,6 +1178,7 @@ def run_distillation(config: DistillationConfig) -> dict[str, Any]:
         "device_effective": resolved_device,
         "train_fliplr_effective": float(train_fliplr),
         "export_end2end": bool(config.export_end2end),
+        "openvino_int8": bool(config.openvino_int8),
         "exported": exported_paths,
         "export_reports": export_reports,
         "parity": parity,
@@ -570,9 +1203,11 @@ def export_model_artifacts(
     nms: bool,
     end2end: bool,
     strict_validation: bool,
+    openvino_int8: bool,
+    task: str,
 ) -> tuple[dict[str, str], list[dict[str, Any]]]:
     formats = tuple(dict.fromkeys(fmt.lower().strip() for fmt in export_formats if fmt))
-    model = YOLO(str(model_path), task="segment", verbose=False)
+    model = YOLO(str(model_path), task=task, verbose=False)
 
     exported_paths: dict[str, str] = {}
     reports: list[dict[str, Any]] = []
@@ -599,12 +1234,13 @@ def export_model_artifacts(
             raise RuntimeError(f"ONNX validation failed: {message}")
 
     if "openvino" in formats:
+        use_int8 = bool(openvino_int8)
         kwargs = {
             "format": "openvino",
             "imgsz": int(imgsz),
             "dynamic": bool(dynamic),
-            "half": True,
-            "int8": False,
+            "half": not use_int8,
+            "int8": use_int8,
             "batch": int(batch),
             "nms": bool(nms),
             "end2end": bool(end2end),
@@ -664,6 +1300,7 @@ def run_export_parity_check(
     data_yaml: str,
     imgsz: int,
     max_samples: int,
+    task: str,
 ) -> dict[str, Any] | None:
     if not exported:
         return None
@@ -672,22 +1309,32 @@ def run_export_parity_check(
     if not sample_images:
         return {"ok": False, "reason": "No validation images discovered for parity check"}
 
-    ref_model = YOLO(str(model_path), task="segment", verbose=False)
-    ref_stats = _collect_prediction_signature(ref_model, sample_images, imgsz)
+    ref_model = YOLO(str(model_path), task=task, verbose=False)
+    ref_stats = _collect_prediction_signature(ref_model, sample_images, imgsz, task=task)
 
     target_reports: dict[str, Any] = {}
     ok = True
     for fmt, artifact in exported.items():
-        target_model = YOLO(str(artifact), task="segment", verbose=False)
-        target_stats = _collect_prediction_signature(target_model, sample_images, imgsz)
+        target_model = YOLO(str(artifact), task=task, verbose=False)
+        target_stats = _collect_prediction_signature(target_model, sample_images, imgsz, task=task)
 
         mean_abs_count_gap = abs(ref_stats["mean_count"] - target_stats["mean_count"])
         mean_abs_conf_gap = abs(ref_stats["mean_conf"] - target_stats["mean_conf"])
-        mean_abs_mask_area_gap = abs(ref_stats["mean_mask_area"] - target_stats["mean_mask_area"])
-        mask_area_rel_gap = mean_abs_mask_area_gap / max(ref_stats["mean_mask_area"], 1e-6)
-
-        # Confidence scales can differ across backends; use count+mask parity as stable criteria.
-        fmt_ok = mean_abs_count_gap <= 1.0 and mask_area_rel_gap <= 0.20
+        mean_abs_mask_area_gap = 0.0
+        mask_area_rel_gap = 0.0
+        mean_abs_kpt_xy_gap = 0.0
+        mean_abs_kpt_vis_gap = 0.0
+        if task == "segment":
+            mean_abs_mask_area_gap = abs(ref_stats["mean_mask_area"] - target_stats["mean_mask_area"])
+            mask_area_rel_gap = mean_abs_mask_area_gap / max(ref_stats["mean_mask_area"], 1e-6)
+            # Confidence scales can differ across backends; use count+mask parity as stable criteria.
+            fmt_ok = mean_abs_count_gap <= 1.0 and mask_area_rel_gap <= 0.20
+        elif task == "pose":
+            mean_abs_kpt_xy_gap = abs(ref_stats["mean_kpt_xy"] - target_stats["mean_kpt_xy"])
+            mean_abs_kpt_vis_gap = abs(ref_stats["mean_kpt_vis"] - target_stats["mean_kpt_vis"])
+            fmt_ok = mean_abs_count_gap <= 1.0 and mean_abs_kpt_xy_gap <= 0.08 and mean_abs_kpt_vis_gap <= 0.15
+        else:
+            fmt_ok = mean_abs_count_gap <= 1.0
         ok = ok and fmt_ok
         target_reports[fmt] = {
             "ok": fmt_ok,
@@ -696,6 +1343,8 @@ def run_export_parity_check(
             "mean_abs_conf_gap": mean_abs_conf_gap,
             "mean_abs_mask_area_gap": mean_abs_mask_area_gap,
             "mask_area_rel_gap": mask_area_rel_gap,
+            "mean_abs_kpt_xy_gap": mean_abs_kpt_xy_gap,
+            "mean_abs_kpt_vis_gap": mean_abs_kpt_vis_gap,
             "reference": ref_stats,
             "target": target_stats,
         }
@@ -766,10 +1415,12 @@ def discover_sample_images_from_data_yaml(data_yaml: str, split: str = "val", li
     return unique_images
 
 
-def _collect_prediction_signature(model: YOLO, images: list[Path], imgsz: int) -> dict[str, float]:
+def _collect_prediction_signature(model: YOLO, images: list[Path], imgsz: int, *, task: str) -> dict[str, float]:
     total_count = 0.0
     total_conf = 0.0
     total_masks = 0.0
+    total_kpt_xy = 0.0
+    total_kpt_vis = 0.0
 
     for image_path in images:
         result = model.predict(source=str(image_path), imgsz=imgsz, verbose=False)[0]
@@ -781,18 +1432,37 @@ def _collect_prediction_signature(model: YOLO, images: list[Path], imgsz: int) -
             conf = 0.0
 
         mask_area = 0.0
-        if result.masks is not None and hasattr(result.masks, "data") and result.masks.data is not None:
-            mask_area = float(result.masks.data.float().sum().item())
+        if task == "segment":
+            if result.masks is not None and hasattr(result.masks, "data") and result.masks.data is not None:
+                mask_area = float(result.masks.data.float().sum().item())
+
+        kpt_xy = 0.0
+        kpt_vis = 0.0
+        if task == "pose" and result.keypoints is not None:
+            kpt_data = None
+            if hasattr(result.keypoints, "xyn") and result.keypoints.xyn is not None:
+                kpt_data = result.keypoints.xyn
+            elif hasattr(result.keypoints, "data") and result.keypoints.data is not None:
+                kpt_data = result.keypoints.data
+            if isinstance(kpt_data, torch.Tensor) and kpt_data.numel() > 0:
+                xy = kpt_data[..., :2]
+                kpt_xy = float(xy.float().mean().item())
+                if kpt_data.shape[-1] >= 3:
+                    kpt_vis = float(kpt_data[..., 2].float().mean().item())
 
         total_count += count
         total_conf += conf
         total_masks += mask_area
+        total_kpt_xy += kpt_xy
+        total_kpt_vis += kpt_vis
 
     n = max(len(images), 1)
     return {
         "mean_count": total_count / n,
         "mean_conf": total_conf / n,
         "mean_mask_area": total_masks / n,
+        "mean_kpt_xy": total_kpt_xy / n,
+        "mean_kpt_vis": total_kpt_vis / n,
     }
 
 
@@ -804,6 +1474,17 @@ def _resolve_data_source(value: str, *, outdir: Path | None = None) -> str:
     if path.suffix.lower() not in {".yaml", ".yml"}:
         return str(path)
     return _autofix_data_yaml(path, outdir=outdir)
+
+
+def _resolve_task(value: str | None) -> str:
+    raw = "segment" if value is None else str(value).strip().lower()
+    if raw in {"detect", "detection", "det"}:
+        return "detect"
+    if raw in {"segment", "seg"}:
+        return "segment"
+    if raw in {"pose", "keypoint", "keypoints"}:
+        return "pose"
+    raise ValueError(f"Unsupported task: {value!r}. Expected 'detect', 'segment', or 'pose'.")
 
 
 def _resolve_train_fliplr_for_data_yaml(data_yaml: str, default_fliplr: float = 0.5) -> float:

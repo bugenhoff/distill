@@ -38,6 +38,9 @@ args.yaml
 *.log
 *.tmp
 
+# NDJSON exports
+*.ndjson
+
 # Dataset generated files
 nano-detect-model/Fishi-fishi-move-move-saddle.v2i.yolo26/train_oversampled.txt
 
@@ -48,3 +51,6 @@ nano-detect-model/
 nano-detect-model/Fishi-fishi-move-move-saddle.v2i.yolo26/train/
 nano-detect-model/Fishi-fishi-move-move-saddle.v2i.yolo26/valid/
 nano-detect-model/Fishi-fishi-move-move-saddle.v2i.yolo26/test/
+datasets/
+medium_320_det/
+merge/
