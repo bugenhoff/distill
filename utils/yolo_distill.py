@@ -9,7 +9,6 @@ from typing import Any, Iterable
 
 import torch
 import torch.nn.functional as F
-
 from ultralytics import YOLO
 from ultralytics.models.yolo.detect.train import DetectionTrainer
 from ultralytics.models.yolo.pose.train import PoseTrainer
@@ -53,7 +52,7 @@ class DistillationConfig:
     export_batch: int = 1
     export_simplify: bool = True
     export_nms: bool = False
-    export_end2end: bool = False
+    export_end2end: bool | None = None
     parity_samples: int = 12
     strict_export_validation: bool = False
     strict_parity: bool = False
@@ -798,7 +797,8 @@ class DistillationSegTrainer(SegmentationTrainer):
         self._teacher_model = teacher_model
 
         LOGGER.info(
-            "[DISTILL] Enabled KD: alpha=%.3f temp=%.3f kd_gain=%.3f weights(cls=%.2f box=%.2f mask=%.2f proto=%.2f semseg=%.2f)",
+            "[DISTILL] Enabled KD: alpha=%.3f temp=%.3f kd_gain=%.3f "
+            "weights(cls=%.2f box=%.2f mask=%.2f proto=%.2f semseg=%.2f)",
             self.alpha,
             self.temperature,
             self.kd_gain,
@@ -1133,6 +1133,7 @@ def run_distillation(config: DistillationConfig) -> dict[str, Any]:
     export_reports: list[dict[str, Any]] = []
     exported_paths: dict[str, str] = {}
     if config.export_formats:
+        export_end2end = resolved_task == "detect" if config.export_end2end is None else bool(config.export_end2end)
         LOGGER.info("[DISTILL] Stage=export_begin formats=%s", list(config.export_formats))
         exported_paths, export_reports = export_model_artifacts(
             model_path=best_distilled,
@@ -1144,7 +1145,7 @@ def run_distillation(config: DistillationConfig) -> dict[str, Any]:
             batch=config.export_batch,
             simplify=config.export_simplify,
             nms=config.export_nms,
-            end2end=config.export_end2end,
+            end2end=export_end2end,
             strict_validation=config.strict_export_validation,
             openvino_int8=config.openvino_int8,
             task=resolved_task,
@@ -1177,7 +1178,7 @@ def run_distillation(config: DistillationConfig) -> dict[str, Any]:
         "device_requested": str(config.device),
         "device_effective": resolved_device,
         "train_fliplr_effective": float(train_fliplr),
-        "export_end2end": bool(config.export_end2end),
+        "export_end2end": resolved_task == "detect" if config.export_end2end is None else bool(config.export_end2end),
         "openvino_int8": bool(config.openvino_int8),
         "exported": exported_paths,
         "export_reports": export_reports,
@@ -1208,11 +1209,18 @@ def export_model_artifacts(
 ) -> tuple[dict[str, str], list[dict[str, Any]]]:
     formats = tuple(dict.fromkeys(fmt.lower().strip() for fmt in export_formats if fmt))
     model = YOLO(str(model_path), task=task, verbose=False)
+    actual_task = _resolve_task(model.task)
+    if actual_task != task:
+        raise RuntimeError(f"Checkpoint task mismatch: selected task={task!r}, checkpoint task={actual_task!r}")
+    num_classes = int(getattr(model.model, "nc", len(getattr(model, "names", {}))))
+    if num_classes <= 0:
+        raise RuntimeError(f"Cannot determine class count for export: {model_path}")
 
     exported_paths: dict[str, str] = {}
     reports: list[dict[str, Any]] = []
 
     if "onnx" in formats:
+        _set_export_head_mode(model, end2end=end2end)
         kwargs = {
             "format": "onnx",
             "imgsz": int(imgsz),
@@ -1227,13 +1235,20 @@ def export_model_artifacts(
         LOGGER.info("[EXPORT] ONNX args: %s", kwargs)
         onnx_path = Path(model.export(**kwargs))
         onnx_path = _move_artifact_if_needed(onnx_path, outdir)
-        ok, message = validate_onnx_artifact(onnx_path)
+        ok, message = validate_onnx_artifact(
+            onnx_path,
+            task=task,
+            num_classes=num_classes,
+            end2end=bool(end2end),
+            nms=bool(nms),
+        )
         reports.append({"format": "onnx", "artifact": str(onnx_path), "ok": ok, "message": message})
         exported_paths["onnx"] = str(onnx_path)
-        if strict_validation and not ok:
+        if not ok and (strict_validation or task == "detect"):
             raise RuntimeError(f"ONNX validation failed: {message}")
 
     if "openvino" in formats:
+        _set_export_head_mode(model, end2end=end2end)
         use_int8 = bool(openvino_int8)
         kwargs = {
             "format": "openvino",
@@ -1248,16 +1263,90 @@ def export_model_artifacts(
         LOGGER.info("[EXPORT] OpenVINO args: %s", kwargs)
         ov_path = Path(model.export(**kwargs))
         ov_path = _move_artifact_if_needed(ov_path, outdir)
-        ok, message = validate_openvino_artifact(ov_path)
+        ok, message = validate_openvino_artifact(
+            ov_path,
+            task=task,
+            num_classes=num_classes,
+            end2end=bool(end2end),
+            nms=bool(nms),
+        )
         reports.append({"format": "openvino", "artifact": str(ov_path), "ok": ok, "message": message})
         exported_paths["openvino"] = str(ov_path)
-        if strict_validation and not ok:
+        if not ok and (strict_validation or task == "detect"):
             raise RuntimeError(f"OpenVINO validation failed: {message}")
 
     return exported_paths, reports
 
 
-def validate_onnx_artifact(artifact_path: Path) -> tuple[bool, str]:
+def _set_export_head_mode(model: YOLO, *, end2end: bool) -> None:
+    inner_model = model.model
+    if not hasattr(inner_model, "end2end"):
+        raise RuntimeError(f"Model task={model.task!r} does not expose an end2end export mode")
+    inner_model.end2end = bool(end2end)
+    effective = bool(getattr(inner_model, "end2end", False))
+    if effective != bool(end2end):
+        raise RuntimeError(f"Failed to set export head mode: requested end2end={end2end}, effective={effective}")
+    mode = "end-to-end [batch, max_det, 6]" if effective else "raw [batch, 4+classes, anchors]"
+    LOGGER.info("[EXPORT] Task=%s output mode=%s", model.task, mode)
+
+
+def _onnx_value_shape(value_info: Any) -> tuple[int | None, ...]:
+    dimensions = value_info.type.tensor_type.shape.dim
+    return tuple(
+        int(dim.dim_value) if dim.HasField("dim_value") and int(dim.dim_value) > 0 else None for dim in dimensions
+    )
+
+
+def _openvino_partial_shape(partial_shape: Any) -> tuple[int | None, ...]:
+    shape: list[int | None] = []
+    for dimension in partial_shape:
+        is_static = dimension.is_static() if callable(dimension.is_static) else bool(dimension.is_static)
+        shape.append(int(dimension.get_length()) if is_static else None)
+    return tuple(shape)
+
+
+def _validate_export_output_signature(
+    output_shapes: list[tuple[int | None, ...]],
+    *,
+    task: str | None,
+    num_classes: int | None,
+    end2end: bool,
+    nms: bool,
+) -> tuple[bool, str]:
+    shapes_text = ", ".join(str(shape) for shape in output_shapes) or "<none>"
+    if task != "detect":
+        return True, f"output shapes={shapes_text}"
+    if len(output_shapes) != 1:
+        return False, f"invalid detect output count={len(output_shapes)}; shapes={shapes_text}"
+
+    shape = output_shapes[0]
+    if len(shape) != 3:
+        return False, f"invalid detect output rank={len(shape)}, expected 3; shape={shape}"
+
+    if end2end or nms:
+        if shape[2] not in {None, 6}:
+            return False, f"invalid end-to-end detect output shape={shape}, expected [batch, max_det, 6]"
+        return True, f"detect end-to-end output shape={shape}"
+
+    if num_classes is None or num_classes <= 0:
+        return False, f"cannot validate raw detect output without class count; shape={shape}"
+    expected_channels = 4 + int(num_classes)
+    if shape[1] not in {None, expected_channels}:
+        return False, (
+            f"invalid raw detect output shape={shape}, expected [batch, {expected_channels}, anchors] "
+            f"for {num_classes} classes"
+        )
+    return True, f"detect raw output shape={shape}"
+
+
+def validate_onnx_artifact(
+    artifact_path: Path,
+    *,
+    task: str | None = None,
+    num_classes: int | None = None,
+    end2end: bool = False,
+    nms: bool = False,
+) -> tuple[bool, str]:
     if not artifact_path.exists():
         return False, f"ONNX file not found: {artifact_path}"
     try:
@@ -1268,12 +1357,29 @@ def validate_onnx_artifact(artifact_path: Path) -> tuple[bool, str]:
     try:
         model = onnx.load(str(artifact_path))
         onnx.checker.check_model(model)
-        return True, "ONNX checker: OK"
+        output_shapes = [_onnx_value_shape(output) for output in model.graph.output]
+        signature_ok, signature_message = _validate_export_output_signature(
+            output_shapes,
+            task=task,
+            num_classes=num_classes,
+            end2end=end2end,
+            nms=nms,
+        )
+        if not signature_ok:
+            return False, f"ONNX checker: OK; {signature_message}"
+        return True, f"ONNX checker: OK; {signature_message}"
     except Exception as exc:
         return False, f"ONNX checker error: {exc}"
 
 
-def validate_openvino_artifact(artifact_path: Path) -> tuple[bool, str]:
+def validate_openvino_artifact(
+    artifact_path: Path,
+    *,
+    task: str | None = None,
+    num_classes: int | None = None,
+    end2end: bool = False,
+    nms: bool = False,
+) -> tuple[bool, str]:
     if not artifact_path.exists():
         return False, f"OpenVINO artifact not found: {artifact_path}"
     try:
@@ -1287,8 +1393,18 @@ def validate_openvino_artifact(artifact_path: Path) -> tuple[bool, str]:
     try:
         xml_path = _resolve_openvino_xml_path(artifact_path)
         core = Core()
-        core.read_model(str(xml_path))
-        return True, f"OpenVINO read_model: OK ({xml_path.name})"
+        model = core.read_model(str(xml_path))
+        output_shapes = [_openvino_partial_shape(output.get_partial_shape()) for output in model.outputs]
+        signature_ok, signature_message = _validate_export_output_signature(
+            output_shapes,
+            task=task,
+            num_classes=num_classes,
+            end2end=end2end,
+            nms=nms,
+        )
+        if not signature_ok:
+            return False, f"OpenVINO read_model: OK ({xml_path.name}); {signature_message}"
+        return True, f"OpenVINO read_model: OK ({xml_path.name}); {signature_message}"
     except Exception as exc:
         return False, f"OpenVINO validation error: {exc}"
 

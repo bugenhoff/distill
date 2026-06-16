@@ -293,6 +293,11 @@ class DistillGui(QWidget):
         self.export_openvino_int8_cb = QCheckBox("OpenVINO (INT8)")
         self.export_openvino_int8_cb.toggled.connect(self._sync_openvino_precision_state)
         self.dynamic_cb = QCheckBox("Dynamic shapes")
+        self.raw_detect_cb = QCheckBox("Legacy raw detect output")
+        self.raw_detect_cb.setToolTip(
+            "Off (recommended): native YOLO26 NMS-free output [batch, 300, 6]. "
+            "On: legacy raw output [batch, 4+classes, anchors] for classic YOLO decoders."
+        )
         self.strict_validation_cb = QCheckBox("Strict export validation")
         self.strict_parity_cb = QCheckBox("Strict parity")
 
@@ -302,6 +307,7 @@ class DistillGui(QWidget):
         export_layout.addWidget(self.dynamic_cb, 0, 3)
         export_layout.addWidget(self.strict_validation_cb, 1, 0)
         export_layout.addWidget(self.strict_parity_cb, 1, 1)
+        export_layout.addWidget(self.raw_detect_cb, 1, 2, 1, 2)
 
         controls = QHBoxLayout()
         layout.addLayout(controls)
@@ -352,6 +358,9 @@ class DistillGui(QWidget):
     def _on_task_changed(self, *, apply_defaults: bool) -> None:
         task = self.task_combo.currentText().strip().lower() or "segment"
         self.setWindowTitle(f"YOLO26 Distillation ({task})")
+        self.raw_detect_cb.setEnabled(task == "detect")
+        if task != "detect":
+            self.raw_detect_cb.setChecked(False)
 
         student = self.student_edit.text().strip().lower()
         known_defaults = {"", "yolo26n.pt", "yolo26n-seg.pt", "yolo26n-pose.pt"}
@@ -387,7 +396,11 @@ class DistillGui(QWidget):
                 "INT8 is off to preserve accuracy until you validate mAP.\n"
             )
         elif task == "detect":
-            self._append_log("[GUI] Detect defaults applied: student=yolo26n.pt, KD uses cls+box terms.\n")
+            self.raw_detect_cb.setChecked(False)
+            self._append_log(
+                "[GUI] Detect defaults applied: student=yolo26n.pt, KD uses cls+box terms, "
+                "export output is native YOLO26 NMS-free [batch, 300, 6].\n"
+            )
 
     def _field_map(self) -> dict[str, QLineEdit]:
         return {
@@ -605,6 +618,8 @@ class DistillGui(QWidget):
 
         if self.dynamic_cb.isChecked():
             cmd.append("--export-dynamic")
+        if self.raw_detect_cb.isChecked():
+            cmd.append("--export-raw-detect")
         if self.strict_validation_cb.isChecked():
             cmd.append("--strict-export-validation")
         if self.strict_parity_cb.isChecked():
@@ -772,6 +787,7 @@ class DistillGui(QWidget):
             "export_openvino": self.export_openvino_cb,
             "export_openvino_int8": self.export_openvino_int8_cb,
             "dynamic": self.dynamic_cb,
+            "export_raw_detect": self.raw_detect_cb,
             "strict_validation": self.strict_validation_cb,
             "strict_parity": self.strict_parity_cb,
         }
@@ -807,6 +823,7 @@ class DistillGui(QWidget):
             "export_openvino": self.export_openvino_cb.isChecked(),
             "export_openvino_int8": self.export_openvino_int8_cb.isChecked(),
             "dynamic": self.dynamic_cb.isChecked(),
+            "export_raw_detect": self.raw_detect_cb.isChecked(),
             "strict_validation": self.strict_validation_cb.isChecked(),
             "strict_parity": self.strict_parity_cb.isChecked(),
         }

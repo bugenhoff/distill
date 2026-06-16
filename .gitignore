@@ -54,3 +54,13 @@ nano-detect-model/Fishi-fishi-move-move-saddle.v2i.yolo26/test/
 datasets/
 medium_320_det/
 merge/
+fish-windows/
+new/
+clean/
+# yolo export \
+#   model=medium_320_det/best_distilled.pt \
+#   format=openvino \
+#   imgsz=320 \
+#   int8=true \
+#   data="medium_320_det/datasets/merged-detect-yolo (1)_detect_yolo/data.yaml" \
+#   dynamic=false

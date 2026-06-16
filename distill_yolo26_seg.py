@@ -95,10 +95,19 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--export-batch", type=int, default=1)
     parser.add_argument("--no-export-simplify", action="store_true", help="Disable ONNX graph simplify")
     parser.add_argument("--export-nms", action="store_true", help="Embed NMS into exported graph")
-    parser.add_argument(
+    export_head_group = parser.add_mutually_exclusive_group()
+    export_head_group.add_argument(
         "--export-end2end",
+        dest="export_end2end",
         action="store_true",
-        help="Export one-to-one end2end head (YOLO26 default); by default script uses end2end=False for better parity.",
+        default=None,
+        help="Export native YOLO26 NMS-free output [batch,max_det,6] (the default for detect).",
+    )
+    export_head_group.add_argument(
+        "--export-raw-detect",
+        dest="export_end2end",
+        action="store_false",
+        help="Export legacy raw detect output [batch,4+classes,anchors] for classic YOLO decoders.",
     )
     parser.add_argument("--parity-samples", type=int, default=12)
     parser.add_argument("--strict-export-validation", action="store_true")
