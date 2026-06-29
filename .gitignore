@@ -57,6 +57,9 @@ merge/
 fish-windows/
 new/
 clean/
+fromyolotoyolo/
+med-to-nano-ench/
+try2/
 # yolo export \
 #   model=medium_320_det/best_distilled.pt \
 #   format=openvino \
