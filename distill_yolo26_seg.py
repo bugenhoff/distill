@@ -2,7 +2,7 @@
 """Distill YOLO26 detect/segment/pose teacher into nano student and export ONNX/OpenVINO.
 
 Examples:
-  .venv/bin/python scripts/distill_yolo26_seg.py \
+  uv run distill_yolo26_seg.py \
       --teacher /path/to/teacher.pt \
       --student-init yolo26n-seg.pt \
       --data /path/to/dataset.yaml \
@@ -21,7 +21,7 @@ _ROOT = Path(__file__).resolve().parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from utils.yolo_distill import DistillationConfig, run_distillation  # noqa: E402
+from distill.yolo_distill import DistillationConfig, run_distillation  # noqa: E402
 
 
 def _configure_console_logging() -> None:
@@ -149,9 +149,9 @@ def _prepare_ndjson_data_source(args: argparse.Namespace) -> str:
     )
 
     if args.task == "detect":
-        from utils.detect_ndjson_to_yolo import convert
+        from distill.detect_ndjson_to_yolo import convert
     else:
-        from utils.pose_ndjson_to_yolo import convert
+        from distill.pose_ndjson_to_yolo import convert
 
     summary = convert(
         data_path.resolve(),

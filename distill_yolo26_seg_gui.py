@@ -149,34 +149,34 @@ def _check_python_runtime_requirements(python_exec: str, *, need_onnx: bool, nee
 
     if probe.returncode != 0:
         details = (probe.stderr or probe.stdout or "").strip()
-        msg = "Не удалось проверить Python-пакеты в целевом окружении."
+        msg = "Failed to check Python packages in the target environment."
         if details:
-            msg = f"{msg}\n\nДетали:\n{details}"
+            msg = f"{msg}\n\nDetails:\n{details}"
         return False, msg
 
     try:
         payload = json.loads(probe.stdout.strip())
     except Exception:
-        return False, "Не удалось разобрать результат проверки пакетов. Выполните: uv sync"
+        return False, "Failed to parse the package check result. Run: uv sync"
 
     missing = payload.get("missing") if isinstance(payload, dict) else None
     cuda_ok = payload.get("cuda_ok") if isinstance(payload, dict) else False
     torch_error = payload.get("torch_error") if isinstance(payload, dict) else ""
 
     if not isinstance(missing, list):
-        return False, "Некорректный формат проверки пакетов. Выполните: uv sync"
+        return False, "Unexpected package check output format. Run: uv sync"
 
     problems: list[str] = []
     if missing:
-        problems.append("Не найдены Python-пакеты: " + ", ".join(str(x) for x in missing))
+        problems.append("Missing Python packages: " + ", ".join(str(x) for x in missing))
     if not cuda_ok:
-        problems.append("CUDA недоступна в torch (torch.cuda.is_available() == False)")
+        problems.append("CUDA is not available in torch (torch.cuda.is_available() == False)")
     if torch_error:
-        problems.append(f"Ошибка torch: {torch_error}")
+        problems.append(f"torch error: {torch_error}")
 
     if problems:
         install_hint = (
-            "Установите зависимости и проверьте GPU:\n"
+            "Install dependencies and check the GPU:\n"
             "1) uv sync\n"
             '2) uv run python -c "import torch; print(torch.cuda.is_available())"'
         )
@@ -505,9 +505,9 @@ class DistillGui(QWidget):
         )
 
         if task == "detect":
-            from utils.detect_ndjson_to_yolo import convert
+            from distill.detect_ndjson_to_yolo import convert
         else:
-            from utils.pose_ndjson_to_yolo import convert
+            from distill.pose_ndjson_to_yolo import convert
 
         def on_download_progress(done: int, total: int) -> None:
             self._append_log(f"[DATA] downloaded {done}/{total}\n")
