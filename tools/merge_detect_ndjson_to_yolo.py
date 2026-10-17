@@ -12,8 +12,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-
-DEFAULT_INPUTS = (Path("merge/out320.ndjson"), Path("merge/player-mob.ndjson"))
 DEFAULT_OUTDIR = Path("merge/merged_detect_yolo")
 
 
@@ -51,7 +49,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--inputs",
         nargs="+",
-        default=[str(path) for path in DEFAULT_INPUTS],
+        required=True,
         help="Input detect NDJSON files",
     )
     parser.add_argument("--outdir", default=str(DEFAULT_OUTDIR), help="Output directory for merged YOLO dataset")

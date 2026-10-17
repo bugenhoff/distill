@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-import sys, os, pathlib
+import pathlib
+import sys
+
 from PIL import Image
 
 IMG_EXTS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.tif', '.webp', '.avif'}

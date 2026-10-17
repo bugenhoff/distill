@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-import sys, os, shutil, pathlib
+import pathlib
+import shutil
+import sys
 
 IMG_EXTS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.tif', '.webp', '.avif'}
 

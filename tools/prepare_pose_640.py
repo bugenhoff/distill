@@ -13,7 +13,7 @@ from typing import Any
 try:
     from PIL import Image
 except ImportError as exc:  # pragma: no cover - exercised by CLI users.
-    raise SystemExit("Pillow is required. Run with: uv run python prepare_posepose_640.py") from exc
+    raise SystemExit("Pillow is required. Run with: uv run python tools/prepare_pose_640.py") from exc
 
 try:
     import yaml
@@ -22,8 +22,8 @@ except ImportError:  # pragma: no cover - PyYAML is available in the uv env.
 
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
-DEFAULT_SOURCE = Path("/home/bugen/distill/datasets/posepose")
-DEFAULT_OUTPUT = Path("/home/bugen/distill/datasets/posepose_640")
+DEFAULT_SOURCE = Path("datasets/pose")
+DEFAULT_OUTPUT = Path("datasets/pose_640")
 SOURCE_SIZE = (640, 640)
 CROP_SIZE = (640, 640)
 SPLIT_ORDER = {"train": 0, "val": 1, "valid": 1, "test": 2}
@@ -57,7 +57,7 @@ class RunStats:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Filter a YOLO-pose dataset to 1920x1080 source images, center-crop accepted images to "
+            "Filter a YOLO-pose dataset by source image size, center-crop accepted images to "
             "640x640, update labels, and optionally remove near-duplicate crops."
         )
     )
